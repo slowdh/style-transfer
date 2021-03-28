@@ -7,7 +7,7 @@ from tensorflow.keras.models import Model
 
 
 def tensor_to_image(tensor):
-    np_image = np.array(tensor * 255, dtype=np.uint8)
+    np_image = np.array(tensor * 255, dtype=np.uint8)[0,...]
     return Image.fromarray(np_image)
 
 def get_vgg_model():
@@ -23,14 +23,15 @@ def get_transfer_model(vgg_model, layers):
 def get_gram_matrix(tensor):
     _, nh, nw, nc = tensor.shape
     unrolled = tf.reshape(tensor, (-1, nc))
-    gram = tf.matmul(unrolled, tf.transpose(unrolled))
+    gram = tf.matmul(tf.transpose(unrolled), unrolled)
     return gram
 
 def compute_style_cost(noise_output, style_output):
     _, n_h, n_w, n_c = noise_output.shape
     gram_noise = get_gram_matrix(noise_output)
     gram_style = get_gram_matrix(style_output)
-    cost = 1 / (4 * n_h * n_w * n_c) * tf.reduce_sum((gram_noise - gram_style) ** 2)
+    factor = 1 / (4 * (n_h * n_w * n_c) ** 2)
+    cost = factor * tf.reduce_sum((gram_noise - gram_style) ** 2)
     return cost
 
 def compute_content_cost(noise_output, content_output):
@@ -61,9 +62,9 @@ def get_total_loss(noise_contents, noise_styles, precomputed_content_outputs, pr
     total = alpha * total_content_loss + beta * total_style_loss
     return total
 
-def generate_noise_image(content_img, ratio=0.8):
+def generate_noise_image(content_img, ratio=0.9):
     _, c_h, c_w, c_c = content_img.shape
-    noise_image = tf.convert_to_tensor(np.random.uniform(-20, 20, (1, c_h, c_w, c_c)))
+    noise_image = tf.convert_to_tensor(np.random.uniform(0, 1, (1, c_h, c_w, c_c)))
     image = noise_image * ratio + content_img * (1 - ratio)
     return image
 
@@ -71,18 +72,20 @@ def clip_0_1(image):
     clipped = tf.clip_by_value(image, clip_value_min=0, clip_value_max=1)
     return clipped
 
-@tf.function()
-def train_step(noise):
-    # should predefine extractor on wider scope
+def train_step(extractor, noise, precomputed_content_outputs, precomputed_style_outputs, optimizer, alpha=1e4, beta=1e-2):
     with tf.GradientTape() as tape:
-        noise_outputs = extractor(noise)
+        preprocessed_noise = tf.keras.applications.vgg19.preprocess_input(noise * 255.)
+        noise_outputs = extractor(preprocessed_noise)
         noise_styles, noise_contents = split_style_content_outputs(noise_outputs)
-        loss = get_total_loss(noise_contents, noise_styles, precomputed_content_outputs, precomputed_style_outputs, alpha=1e4, beta=1e-2)
+        loss = get_total_loss(noise_contents, noise_styles, precomputed_content_outputs, precomputed_style_outputs, alpha, beta)
 
     grad = tape.gradient(loss, noise)
     optimizer.apply_gradients([(grad, noise)])
     noise.assign(clip_0_1(noise))
-    return noise
+    return noise, loss
+
+def preprocess_input(img):
+    return tf.keras.applications.vgg19.preprocess_input(img)
 
 
 # load VGG-19 model
@@ -102,37 +105,27 @@ extractor = get_transfer_model(vgg_model, layers)
 img_size = (224, 224)
 content_img = Image.open('tf2/datasets/sample_images/me.jpeg')
 content_img = content_img.resize(img_size)
-content = tf.expand_dims(tf.convert_to_tensor(np.array(content_img.resize(img_size))[..., :3] / 255.), axis=0)
+content = tf.expand_dims(tf.convert_to_tensor(np.array(content_img.resize(img_size))[..., :3], dtype=tf.float32), axis=0)
 content_outputs = extractor(content)
 _, precomputed_content_outputs = split_style_content_outputs(content_outputs)
 
 style_img = Image.open('tf2/datasets/sample_images/monet_800600.jpg')
-style = tf.expand_dims(tf.convert_to_tensor(np.array(style_img.resize(img_size))[..., :3] / 255.), axis=0)
+style = tf.expand_dims(tf.convert_to_tensor(np.array(style_img.resize(img_size))[..., :3], dtype=tf.float32), axis=0)
 styles = extractor(style)
 precomputed_style_outputs, _ = split_style_content_outputs(styles)
 
 # generate random image
-noise = tf.convert_to_tensor(generate_noise_image(content, 0.8))
+noise = tf.convert_to_tensor(generate_noise_image(content, ratio=0))
 noise = tf.cast(noise, tf.float32)
 noise = tf.Variable(noise)
 
-# train
+# lets make fancy image!
 optimizer = tf.keras.optimizers.Adam(lr=0.01, beta_1=0.99, epsilon=1e-1)
 
 print('Start training')
 for i in range(100):
-    train_step(noise)
-    # with tf.GradientTape() as tape:
-    #     tape.watch(generated)
-    #     a_generated = model(generated)
-    #     cost_content = compute_content_cost(a_content, a_generated)
-    #     cost_style = compute_style_cost(a_style, a_generated)
-    #     loss = get_total_cost(cost_content, cost_style)
-    #
-    # grad = tape.gradient(loss, generated)
-    # optimizer.apply_gradients([(grad, generated)])
-    # generated.assign(clip_0_1(generated))
-    print(i, cost_content)
-
-plt.imshow(generated[0])
-plt.show()
+    noise, loss = train_step(extractor, noise, precomputed_content_outputs, precomputed_style_outputs, optimizer, alpha=1e4, beta=1e-2)
+    print(i, loss)
+    if i % 10 == 0:
+        img = tensor_to_image(noise)
+        img.show()
